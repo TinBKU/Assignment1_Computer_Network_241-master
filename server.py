@@ -53,46 +53,99 @@ class Tracker:
                             f"  - Peer ID: {peer['peer_id']}, IP: {peer['ip']}, Port: {peer['port']}")
                 print()
 
-    def handle_client(self, client_socket, client_address):
-        """Xử lý yêu cầu từ mỗi client."""
-        while True:
-            try:
-                data = client_socket.recv(1024).decode()
-                if not data:
+    def handle_client(self, conn, addr):
+        try:
+            # read until newline (client sends json + "\n")
+            data = b''
+            while not data.endswith(b'\n'):
+                part = conn.recv(4096)
+                if not part:
                     break
+                data += part
+            if not data:
+                conn.close(); return
 
-                # Phân tích yêu cầu của client
-                request = json.loads(data)
-                event = request.get("event")
-                info_hash = request.get("info_hash")
-                peer_id = request.get("peer_id")
-                port = request.get("port")
-
-                # Khởi tạo `response` với giá trị mặc định
-                response = {"status": "unknown_event"}
-
-                # Xử lý từng loại yêu cầu
-                if event == "started":
-                    self.register_client(info_hash, peer_id,
-                                         client_address[0], port)
-                elif event == "stopped":
-                    self.deregister_client(info_hash, peer_id)
-                    response = {"status": "stopped"}
-                elif event == "completed":
-                    response = {"status": "completed"}
-                elif event == "keepalive":
-                    response = {"status": "alive"}
-                elif event == "get_peers":
-                    response = self.get_peers(info_hash, peer_id)
-                # Gửi phản hồi cho client
-                client_socket.sendall(json.dumps(response).encode())
+            try:
+                req = json.loads(data.decode().strip())
             except Exception as e:
-                print(
-                    f"Lỗi trong quá trình xử lý client {client_address}: {e}")
-                break
+                print("Bad request:", e)
+                conn.sendall((json.dumps({"status":"bad_request"}) + "\n").encode())
+                conn.close(); return
 
-        # Ngắt kết nối và loại bỏ client khi kết thúc phiên
-        client_socket.close()
+            event = req.get('event')
+            info_hash = req.get('info_hash')
+            peer_id = req.get('peer_id')
+            port = req.get('port')
+            pieces = req.get('pieces', [])
+
+            # default response
+            response = {"status":"ok"}
+
+            with self.lock:
+                if event == 'started':
+                    if not info_hash or not peer_id:
+                        response = {"status":"missing_fields"}
+                    else:
+                        if info_hash not in self.files:
+                            self.files[info_hash] = []
+                        # remove old entry for same peer_id
+                        self.files[info_hash] = [p for p in self.files[info_hash] if p.get('peer_id') != peer_id]
+                        entry = {'peer_id': peer_id, 'ip': addr[0], 'port': port, 'pieces': pieces}
+                        self.files[info_hash].append(entry)
+                        print(f"Registered peer {peer_id} for {info_hash} pieces={len(pieces)}")
+                        response = {"status":"registered"}
+
+                elif event == 'get_peers':
+                    if not info_hash:
+                        response = {"status":"missing_info_hash"}
+                    else:
+                        peers = []
+                        for p in self.files.get(info_hash, []):
+                            # do not include the requester itself if peer_id provided
+                            if p.get('peer_id') != peer_id:
+                                peers.append(p)
+                        response = {"status":"ok", "peers": peers}
+
+                elif event == 'stopped':
+                    if info_hash in self.files:
+                        before = len(self.files[info_hash])
+                        self.files[info_hash] = [p for p in self.files[info_hash] if p.get('peer_id') != peer_id]
+                        after = len(self.files.get(info_hash, []))
+                        print(f"Peer {peer_id} stopped for {info_hash} ({before}->{after})")
+                        response = {"status":"stopped"}
+
+                elif event == 'keepalive':
+                    # update peer pieces if provided; otherwise mark alive
+                    updated = False
+                    if info_hash:
+                        lst = self.files.setdefault(info_hash, [])
+                        for p in lst:
+                            if p.get('peer_id') == peer_id:
+                                if pieces:
+                                    p['pieces'] = pieces
+                                p['ip'] = addr[0]; p['port'] = port
+                                updated = True
+                        if not updated:
+                            # if not present, register it
+                            entry = {'peer_id': peer_id, 'ip': addr[0], 'port': port, 'pieces': pieces}
+                            self.files[info_hash].append(entry)
+                            updated = True
+                        response = {"status":"alive"}
+
+                else:
+                    response = {"status":"unknown_event"}
+
+            # send response (newline-framed)
+            conn.sendall((json.dumps(response) + "\n").encode())
+
+        except Exception as e:
+            print("Tracker error:", e)
+            try:
+                conn.sendall((json.dumps({"status":"error","detail":str(e)}) + "\n").encode())
+            except:
+                pass
+        finally:
+            conn.close()
 
     def register_client(self, info_hash, peer_id, ip, port):
         """Đăng ký một client vào tracker, xác nhận client chia sẻ file với info_hash cụ thể."""
